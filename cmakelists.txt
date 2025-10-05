@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.15)
+project(hush_core LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+find_package(Threads REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED) # from vcpkg
+
+# Try to locate portaudio; vcpkg should provide it when toolchain file is used.
+find_path(PORTAUDIO_INCLUDE portaudio.h)
+find_library(PORTAUDIO_LIB portaudio)
+
+if (NOT PORTAUDIO_LIB)
+  message(FATAL_ERROR "PortAudio not found. Install via vcpkg and pass the vcpkg toolchain file.")
+endif()
+
+include_directories(${PORTAUDIO_INCLUDE})
+add_executable(hush_core
+  src/main.cpp
+  src/ringbuffer.hpp
+)
+
+target_include_directories(hush_core PRIVATE ${PORTAUDIO_INCLUDE})
+target_link_libraries(hush_core PRIVATE ${PORTAUDIO_LIB} Threads::Threads nlohmann_json::nlohmann_json)
+
+if (WIN32)
+  target_link_libraries(hush_core PRIVATE ws2_32)
+endif()
