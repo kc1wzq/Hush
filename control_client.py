@@ -17,8 +17,8 @@ if __name__ == '__main__':
 
     # >>> pick ids from the list printed by your hush core above.
     # Example: use device 1 as input and 2 as output — CHANGE these to match your system.
-    input_id = 2
-    output_id = 5
+    input_id = 5
+    output_id = 2
 
     # Open streams
     print("Opening streams (change input_id/output_id as needed)...")

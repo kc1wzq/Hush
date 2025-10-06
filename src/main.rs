@@ -194,57 +194,103 @@ fn handle_client(
                 let resp = json!({"ok": true, "devices": arr});
                 writeln!(writer, "{}", resp.to_string())?;
             }
-            "open" => {
-                let input_idx = req.input.unwrap_or(usize::MAX);
-                let output_idx = req.output.unwrap_or(usize::MAX);
-                let sr = req.sr.unwrap_or(DEFAULT_SR);
+                "open" => {
+                    let input_idx = req.input.unwrap_or(usize::MAX);
+                    let output_idx = req.output.unwrap_or(usize::MAX);
+                    let sr = req.sr.unwrap_or(DEFAULT_SR);
 
-                // close old
-                *cur_in = None;
-                *cur_out = None;
-                shared.running.store(false, Ordering::SeqCst);
+                    // close old
+                    *cur_in = None;
+                    *cur_out = None;
+                    shared.running.store(false, Ordering::SeqCst);
 
-                // Input
-                if input_idx < devices.len() {
-                    let device = &devices[input_idx];
-                    let config = device
-                        .default_input_config()
-                        .context("no default input config")?;
-                    let mut cfg = cpal::StreamConfig {
-                        channels: config.channels(),
-                        sample_rate: cpal::SampleRate(sr),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    let stream = build_input_stream(device, &cfg, shared)?;
-                    *cur_in = Some(stream);
+                    // helper to pick a StreamConfig: try default_*_config(), else the first supported_*_configs() with f32
+                    fn pick_input_config(device: &cpal::Device, sr: u32) -> Option<cpal::StreamConfig> {
+                        if let Ok(def) = device.default_input_config() {
+                            return Some(cpal::StreamConfig {
+                                channels: def.channels(),
+                                sample_rate: cpal::SampleRate(sr),
+                                buffer_size: cpal::BufferSize::Default,
+                            });
+                        }
+                        // fallback to supported_input_configs
+                        if let Ok(mut iter) = device.supported_input_configs() {
+                            if let Some(cfg_range) = iter.find(|c| c.sample_format() == cpal::SampleFormat::F32) {
+                                return Some(cpal::StreamConfig {
+                                    channels: cfg_range.channels(),
+                                    sample_rate: cpal::SampleRate(sr),
+                                    buffer_size: cpal::BufferSize::Default,
+                                });
+                            }
+                        }
+                        None
+                    }
+                    fn pick_output_config(device: &cpal::Device, sr: u32) -> Option<cpal::StreamConfig> {
+                        if let Ok(def) = device.default_output_config() {
+                            return Some(cpal::StreamConfig {
+                                channels: def.channels(),
+                                sample_rate: cpal::SampleRate(sr),
+                                buffer_size: cpal::BufferSize::Default,
+                            });
+                        }
+                        if let Ok(mut iter) = device.supported_output_configs() {
+                            if let Some(cfg_range) = iter.find(|c| c.sample_format() == cpal::SampleFormat::F32) {
+                                return Some(cpal::StreamConfig {
+                                    channels: cfg_range.channels(),
+                                    sample_rate: cpal::SampleRate(sr),
+                                    buffer_size: cpal::BufferSize::Default,
+                                });
+                            }
+                        }
+                        None
+                    }
+
+                    // Input
+                    if input_idx < devices.len() {
+                        let device = &devices[input_idx];
+                        if let Some(cfg) = pick_input_config(device, sr) {
+                            match build_input_stream(device, &cfg, shared) {
+                                Ok(s) => *cur_in = Some(s),
+                                Err(e) => {
+                                    let resp = json!({"ok":false,"error":format!("input open failed: {:?}", e)});
+                                    writeln!(writer, "{}", resp.to_string())?;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let resp = json!({"ok":false,"error":"no suitable input config for device"});
+                            writeln!(writer, "{}", resp.to_string())?;
+                            continue;
+                        }
+                    }
+
+                    // Output
+                    if output_idx < devices.len() {
+                        let device = &devices[output_idx];
+                        if let Some(cfg) = pick_output_config(device, sr) {
+                            match build_output_stream(device, &cfg, shared) {
+                                Ok(s) => *cur_out = Some(s),
+                                Err(e) => {
+                                    let resp = json!({"ok":false,"error":format!("output open failed: {:?}", e)});
+                                    writeln!(writer, "{}", resp.to_string())?;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let resp = json!({"ok":false,"error":"no suitable output config for device"});
+                            writeln!(writer, "{}", resp.to_string())?;
+                            continue;
+                        }
+                    }
+
+                    if let Some(s) = cur_in { s.play().ok(); }
+                    if let Some(s) = cur_out { s.play().ok(); }
+
+                    shared.running.store(true, Ordering::SeqCst);
+                    let resp = json!({"ok": true});
+                    writeln!(writer, "{}", resp.to_string())?;
                 }
 
-                // Output
-                if output_idx < devices.len() {
-                    let device = &devices[output_idx];
-                    let config = device
-                        .default_output_config()
-                        .context("no default output config")?;
-                    let mut cfg = cpal::StreamConfig {
-                        channels: config.channels(),
-                        sample_rate: cpal::SampleRate(sr),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    let stream = build_output_stream(device, &cfg, shared)?;
-                    *cur_out = Some(stream);
-                }
-
-                if let Some(s) = cur_in {
-                    s.play().ok();
-                }
-                if let Some(s) = cur_out {
-                    s.play().ok();
-                }
-
-                shared.running.store(true, Ordering::SeqCst);
-                let resp = json!({"ok": true});
-                writeln!(writer, "{}", resp.to_string())?;
-            }
             "close" => {
                 *cur_in = None;
                 *cur_out = None;
