@@ -14,6 +14,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 const CONTROL_PORT: u16 = 53421;
 const DEFAULT_SR: u32 = 48000;
@@ -101,6 +102,7 @@ struct Req {
     path: Option<String>,
     // send_frame params / mode choice
     mode: Option<String>,             // "mfsk" | "dpsk"
+    speed: Option<String>,            // optional preset name, e.g., "MEDIUM"
     mfsk_m: Option<usize>,
     mfsk_center: Option<f32>,
     mfsk_spacing: Option<f32>,
@@ -108,6 +110,20 @@ struct Req {
     preamble_repeats: Option<u32>,
     payload_bits: Option<String>,
 }
+
+// mode setups
+// TODO: work on adding more
+fn presets_map() -> HashMap<&'static str, MfskParams> {
+    let mut m = HashMap::new();
+    m.insert("QRP_ULTRA", MfskParams { m: 4,  center: 1500.0, spacing: 50.0,  symbol_len_ms: 300, preamble_repeats: 8 });
+    m.insert("QRP",       MfskParams { m: 4,  center: 1500.0, spacing: 100.0, symbol_len_ms: 150, preamble_repeats: 6 });
+    m.insert("SLOW",      MfskParams { m: 8,  center: 1500.0, spacing: 100.0, symbol_len_ms: 100, preamble_repeats: 5 });
+    m.insert("MEDIUM",    MfskParams { m: 16, center: 1500.0, spacing: 150.0, symbol_len_ms: 60,  preamble_repeats: 4 });
+    m.insert("FAST",      MfskParams { m: 32, center: 1500.0, spacing: 200.0, symbol_len_ms: 30,  preamble_repeats: 3 });
+    m.insert("TURBO",     MfskParams { m: 64, center: 1500.0, spacing: 240.0, symbol_len_ms: 20,  preamble_repeats: 3 });
+    m
+}
+
 
 // ---------- modems module (generators) ----------
 mod modems {
@@ -212,6 +228,37 @@ mod modems {
 }
 
 // ---------- worker: matched-filter + rms (unchanged logic) ----------
+// ---- Goertzel helper (improved) ----
+// Compute Goertzel energy for frequency `f` (Hz) over `samples` sampled at `sr` (Hz).
+fn goertzel_energy(samples: &[f32], f: f32, sr: f32) -> f32 {
+    let n = samples.len();
+    if n == 0 { return 0.0; }
+    // floating k approximation
+    let kf = (n as f32 * f / sr);
+    let omega = 2.0 * PI * kf / (n as f32);
+    let coeff = 2.0 * omega.cos();
+    let mut s_prev = 0.0f32;
+    let mut s_prev2 = 0.0f32;
+    for &x in samples {
+        let s = x + coeff * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = s;
+    }
+    let power = s_prev2*s_prev2 + s_prev*s_prev - coeff*s_prev*s_prev2;
+    if power.is_sign_negative() { 0.0 } else { power }
+}
+
+// ---- Windowing helper (Hann) ----
+fn apply_hann_inplace(buf: &mut [f32]) {
+    let n = buf.len();
+    if n < 2 { return; }
+    for i in 0..n {
+        let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n as f32)).cos());
+        buf[i] *= w as f32;
+    }
+}
+
+// ---- Worker: matched-filter + symbol sync + MFSK decode ----
 fn worker_thread(shared: Arc<Shared>) {
     let mut sliding: VecDeque<f32> = VecDeque::new();
     let mut template_len = 0usize;
@@ -223,14 +270,15 @@ fn worker_thread(shared: Arc<Shared>) {
             continue;
         }
 
-        // pop some samples from RX ring
+        // pull samples from RX ring
         let mut got_any = false;
-        let mut buff = [0f32; 1024];
+        let mut buff = [0f32; 2048];
         let popped: usize;
         {
             let mut cons = shared.rb_consumer.lock();
             popped = cons.pop_slice(&mut buff);
         }
+
         if popped > 0 {
             got_any = true;
             let sumsq: f64 = buff[..popped].iter().map(|v| (*v as f64) * (*v as f64)).sum();
@@ -241,7 +289,7 @@ fn worker_thread(shared: Arc<Shared>) {
             }
         }
 
-        // update template if available
+        // update preamble template if changed
         if let Some(t) = shared.preamble_template.lock().as_ref() {
             if t.len() != template_len {
                 template_len = t.len();
@@ -249,9 +297,10 @@ fn worker_thread(shared: Arc<Shared>) {
             }
         }
 
-        // matched filter + simple detection
+        // detection + decode
         if template_len > 0 && sliding.len() >= template_len {
-            let start = sliding.len() - template_len;
+            // correlate on the most recent template_len samples
+            let start = sliding.len().saturating_sub(template_len);
             let mut dot = 0f32;
             let mut energy_s = 0f32;
             let mut energy_t = 0f32;
@@ -265,200 +314,155 @@ fn worker_thread(shared: Arc<Shared>) {
             let denom = (energy_s.sqrt() * energy_t.sqrt()).max(1e-12);
             let corr = dot / denom;
 
-            if corr.abs() > 0.55 {
+            // threshold
+            if corr.abs() > 0.50 {
                 let mut last_det = shared.last_detection.lock();
                 let now = Instant::now();
-                if last_det.map(|t| now.duration_since(t)).unwrap_or_else(|| Duration::from_secs(3600)) > Duration::from_millis(400) {
+                if last_det.map(|t| now.duration_since(t)).unwrap_or_else(|| Duration::from_secs(3600)) > Duration::from_millis(800) {
                     println!("[DETECT] matched preamble at {:?} corr={:.3}", now, corr);
                     *last_det = Some(now);
-                    // note: we don't decode symbols here yet — next step will be to decode mode-specific symbols
-                }
-            }
 
-            while sliding.len() > template_len * 2 {
-                sliding.pop_front();
-            }
-        }
+                    if let Some(mode) = shared.current_mode.lock().clone() {
+                        println!("[INFO] decoding with mode: {:?}", mode);
+                    } else {
+                        println!("[INFO] no current_mode set (can't decode mode-specific)");
+                    }
 
-        if !got_any {
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-    // Compute Goertzel energy for frequency `f` (Hz) over `samples` sampled at `sr` (Hz).
-    fn goertzel_energy(samples: &[f32], f: f32, sr: f32) -> f32 {
-        let n = samples.len();
-        if n == 0 { return 0.0; }
-        // Use floating k approximation for short blocks
-        let kf = (n as f32 * f / sr);
-        // Keep omega as 2*pi*(k/n) where k is the floating value
-        let omega = 2.0 * PI * kf / (n as f32);
-        let coeff = 2.0 * omega.cos();
-        let mut s_prev = 0.0f32;
-        let mut s_prev2 = 0.0f32;
-        for &x in samples {
-            let s = x + coeff * s_prev - s_prev2;
-            s_prev2 = s_prev;
-            s_prev = s;
-        }
-        // compute magnitude-like value (not strictly normalized)
-        let power = s_prev2*s_prev2 + s_prev*s_prev - coeff*s_prev*s_prev2;
-        // return non-negative
-        if power.is_sign_negative() { 0.0 } else { power }
-    }
+                    // Attempt MFSK decode if mode set
+                    if let Some(mode_cfg) = shared.current_mode.lock().clone() {
+                        match mode_cfg {
+                            ModeConfig::Mfsk(params) => {
+                                let sr = *shared.sample_rate.lock();
+                                let sym_len = ((params.symbol_len_ms as f32 / 1000.0) * sr as f32).round() as usize;
+                                if sym_len == 0 {
+                                    println!("[DECODE] symbol length too small ({})", sym_len);
+                                } else {
+                                    let preamble_start = sliding.len().saturating_sub(template_len);
+                                    let assumed_payload_start = preamble_start + template_len;
 
-    // ---- New worker: matched-filter + (MFSK) decode ----
-    fn worker_thread(shared: Arc<Shared>) {
-        let mut sliding: VecDeque<f32> = VecDeque::new();
-        let mut template_len = 0usize;
-        let mut template: Vec<f32> = Vec::new();
+                                    // alignment search over ±half-symbol
+                                    let half = sym_len / 2;
+                                    let mut best_offset = 0isize;
+                                    let mut best_conf = -1f32;
+                                    let max_check_symbols = 8usize;
+                                    let m = params.m;
+                                    let center = params.center;
+                                    let spacing = params.spacing;
+                                    let tone0 = center - (spacing * ((m - 1) as f32) / 2.0);
+                                    let sr_f = sr as f32;
 
-        loop {
-            if !shared.running.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-
-            // pop some samples
-            let mut got_any = false;
-            let mut buff = [0f32; 1024];
-            let popped: usize;
-            {
-                let mut cons = shared.rb_consumer.lock();
-                popped = cons.pop_slice(&mut buff);
-            }
-
-            if popped > 0 {
-                got_any = true;
-                // update RMS
-                let sumsq: f64 = buff[..popped].iter().map(|v| (*v as f64) * (*v as f64)).sum();
-                let rms = ((sumsq / (popped as f64)).sqrt()) as f32;
-                *shared.last_rms.lock() = rms;
-
-                // append to sliding window
-                for &s in &buff[..popped] {
-                    sliding.push_back(s);
-                }
-            }
-
-            // update template if changed
-            if let Some(t) = shared.preamble_template.lock().as_ref() {
-                if t.len() != template_len {
-                    template_len = t.len();
-                    template = t.clone();
-                }
-            }
-
-            // matched filter detection
-            if template_len > 0 && sliding.len() >= template_len {
-                // compute correlation on the most recent template_len samples
-                let start = sliding.len() - template_len;
-                let mut dot = 0f32;
-                let mut energy_s = 0f32;
-                let mut energy_t = 0f32;
-                for i in 0..template_len {
-                    let s_val = sliding[start + i];
-                    let t_val = template[i];
-                    dot += s_val * t_val;
-                    energy_s += s_val * s_val;
-                    energy_t += t_val * t_val;
-                }
-                let denom = (energy_s.sqrt() * energy_t.sqrt()).max(1e-12);
-                let corr = dot / denom;
-
-                if corr.abs() > 0.55 {
-                    // Check debounce to avoid spamming
-                    let mut last_det = shared.last_detection.lock();
-                    let now = Instant::now();
-                    if last_det.map(|t| now.duration_since(t)).unwrap_or_else(|| Duration::from_secs(3600)) > Duration::from_millis(400) {
-                        println!("[DETECT] matched preamble at {:?} corr={:.3}", now, corr);
-                        *last_det = Some(now);
-
-                        // ---- Attempt MFSK decode if current mode is Mfsk and enough samples are present ----
-                        if let Some(mode) = shared.current_mode.lock().clone() {
-                            match mode {
-                                ModeConfig::Mfsk(params) => {
-                                    // samples per symbol
-                                    let sr = *shared.sample_rate.lock();
-                                    let sym_len = ((params.symbol_len_ms as f32 / 1000.0) * sr as f32).round() as usize;
-                                    if sym_len == 0 {
-                                        println!("[DECODE] symbol length too small");
-                                    } else {
-                                        // payload start index inside sliding: preamble start + template_len
-                                        // preamble start is (sliding.len() - template_len)
-                                        let preamble_start = sliding.len().saturating_sub(template_len);
-                                        let mut payload_idx = preamble_start + template_len;
-                                        let mut symbols: Vec<usize> = Vec::new();
-
-                                        // We'll decode up to a reasonable limit (avoid runaway)
-                                        let max_symbols = 256usize;
-                                        let m = params.m;
-                                        let center = params.center;
-                                        let spacing = params.spacing;
-                                        let tone0 = center - (spacing * ((m - 1) as f32) / 2.0);
-
-                                        while payload_idx + sym_len <= sliding.len() && symbols.len() < max_symbols {
-                                            // collect block
-                                            let mut block: Vec<f32> = Vec::with_capacity(sym_len);
+                                    for off in -(half as isize)..=(half as isize) {
+                                        let mut energies_sum = 0.0f32;
+                                        let mut valid_blocks = 0usize;
+                                        let mut payload_idx = if off < 0 {
+                                            assumed_payload_start.saturating_sub((-off) as usize)
+                                        } else {
+                                            assumed_payload_start + (off as usize)
+                                        };
+                                        for _ in 0..max_check_symbols {
+                                            if payload_idx + sym_len > sliding.len() { break; }
+                                            let mut block = Vec::with_capacity(sym_len);
                                             for j in 0..sym_len {
                                                 block.push(sliding[payload_idx + j]);
                                             }
-
-                                            // goertzel energies across M tones
-                                            let sr_f = sr as f32;
-                                            let mut best_idx = 0usize;
+                                            apply_hann_inplace(&mut block);
                                             let mut best_e = 0.0f32;
+                                            let mut sum_e = 0.0f32;
                                             for tone_idx in 0..m {
                                                 let f = tone0 + (tone_idx as f32) * spacing;
                                                 let e = goertzel_energy(&block, f, sr_f);
-                                                if e > best_e {
-                                                    best_e = e;
-                                                    best_idx = tone_idx;
-                                                }
+                                                sum_e += e;
+                                                if e > best_e { best_e = e; }
                                             }
-                                            symbols.push(best_idx);
+                                            if sum_e > 0.0 {
+                                                energies_sum += best_e / (sum_e + 1e-12);
+                                                valid_blocks += 1;
+                                            }
                                             payload_idx += sym_len;
+                                        }
+                                        if valid_blocks > 0 {
+                                            let conf = energies_sum / (valid_blocks as f32);
+                                            if conf > best_conf {
+                                                best_conf = conf;
+                                                best_offset = off;
+                                            }
+                                        }
+                                    }
+
+                                    if best_conf < 0.12 {
+                                        println!("[DECODE] alignment search low confidence: {:.3} (increase preamble / symbol duration)", best_conf);
+                                    } else {
+                                        let mut payload_idx = if best_offset < 0 {
+                                            assumed_payload_start.saturating_sub((-best_offset) as usize)
+                                        } else {
+                                            assumed_payload_start + (best_offset as usize)
+                                        };
+
+                                        let mut symbols: Vec<usize> = Vec::new();
+                                        let mut confidences: Vec<f32> = Vec::new();
+
+                                        while payload_idx + sym_len <= sliding.len() {
+                                            let mut block = Vec::with_capacity(sym_len);
+                                            for j in 0..sym_len {
+                                                block.push(sliding[payload_idx + j]);
+                                            }
+                                            apply_hann_inplace(&mut block);
+
+                                            let mut best_idx = 0usize;
+                                            let mut best_e = 0.0f32;
+                                            let mut sum_e = 0.0f32;
+                                            for tone_idx in 0..m {
+                                                let f = tone0 + (tone_idx as f32) * spacing;
+                                                let e = goertzel_energy(&block, f, sr_f);
+                                                sum_e += e;
+                                                if e > best_e { best_e = e; best_idx = tone_idx; }
+                                            }
+                                            let conf = if sum_e > 0.0 { best_e / (sum_e + 1e-12) } else { 0.0 };
+                                            symbols.push(best_idx);
+                                            confidences.push(conf);
+                                            payload_idx += sym_len;
+                                            if symbols.len() > 1024 { break; }
                                         }
 
                                         if !symbols.is_empty() {
-                                            // convert symbols to bits (MSB-first per symbol)
                                             let bits_per_symbol = ((m as f32).log2().round()) as usize;
                                             let mut bitstr = String::new();
                                             for &sym in &symbols {
-                                                // convert sym value to bits_per_symbol bits
                                                 for b in (0..bits_per_symbol).rev() {
                                                     let bit = ((sym >> b) & 1) != 0;
                                                     bitstr.push(if bit { '1' } else { '0' });
                                                 }
                                             }
-                                            println!("[DECODE] MFSK symbols: {:?}  bits: {}", symbols, bitstr);
+                                            let avg_conf: f32 = confidences.iter().copied().sum::<f32>() / (confidences.len() as f32);
+                                            println!("[DECODE] symbols(len={}): {:?}\n         bits: {}\n         avg_conf: {:.3}  best_offset: {}", symbols.len(), symbols, bitstr, avg_conf, best_offset);
                                         } else {
-                                            println!("[DECODE] No payload samples yet (will decode when more samples arrive)");
+                                            println!("[DECODE] no full symbols available after alignment.");
                                         }
                                     }
                                 }
-                                _ => {
-                                    // Not MFSK: for now we only decode MFSK here
-                                    println!("[DECODE] current mode not MFSK — skipping symbol decode.");
-                                }
                             }
-                        } else {
-                            println!("[DECODE] no current_mode set — can't decode.");
+                            _ => {
+                                println!("[DECODE] current_mode not MFSK — skipping detailed decode.");
+                            }
                         }
+                    } else {
+                        println!("[DECODE] no current_mode set — skipping decode.");
                     }
                 }
-
-                // Trim sliding to keep window bounded
-                while sliding.len() > template_len * 3 {
-                    sliding.pop_front();
-                }
             }
 
-            if !got_any {
-                thread::sleep(Duration::from_millis(5));
+            // trim sliding buffer
+            while sliding.len() > template_len * 6 {
+                sliding.pop_front();
             }
+        }
+
+        if !got_any {
+            thread::sleep(Duration::from_millis(3));
         }
     }
 }
+
 
 // ---------- control server & client handling ----------
 fn control_server(
@@ -538,6 +542,14 @@ fn handle_client(
                 let resp = json!({"ok": true, "devices": arr});
                 writeln!(writer, "{}", resp.to_string())?;
             }
+            "list_modes" => {
+                let presets = presets_map();
+                let mut keys: Vec<String> = presets.keys().map(|k| k.to_string()).collect();
+                keys.sort();
+                let resp = json!({"ok": true, "modes": keys});
+                writeln!(writer, "{}", resp.to_string())?;
+            }
+
             "open" => {
                 let input_idx = req.input.unwrap_or(usize::MAX);
                 let output_idx = req.output.unwrap_or(usize::MAX);
@@ -685,28 +697,40 @@ fn handle_client(
                 let mode_str = req.mode.as_deref().unwrap_or("mfsk");
                 let payload = req.payload_bits.as_deref().unwrap_or("101100111000");
 
+                // presets
+                let presets = presets_map();
+
                 let mode_cfg = match mode_str {
                     "mfsk" => {
-                        let m = req.mfsk_m.unwrap_or(4);
-                        let center = req.mfsk_center.unwrap_or(1500.0);
-                        let spacing = req.mfsk_spacing.unwrap_or(200.0);
-                        let sym = req.symbol_len_ms.unwrap_or(80);
-                        let pre_r = req.preamble_repeats.unwrap_or(3);
+                        // start from preset if provided
+                        let base = if let Some(sp) = req.speed.as_deref() {
+                            presets.get(sp).cloned().unwrap_or(MfskParams { m: 4, center: 1500.0, spacing: 200.0, symbol_len_ms: 80, preamble_repeats: 3 })
+                        } else {
+                            MfskParams { m: 4, center: 1500.0, spacing: 200.0, symbol_len_ms: 80, preamble_repeats: 3 }
+                        };
+                        // allow explicit overrides to replace any preset fields
+                        let m = req.mfsk_m.unwrap_or(base.m);
+                        let center = req.mfsk_center.unwrap_or(base.center);
+                        let spacing = req.mfsk_spacing.unwrap_or(base.spacing);
+                        let sym = req.symbol_len_ms.unwrap_or(base.symbol_len_ms);
+                        let pre_r = req.preamble_repeats.unwrap_or(base.preamble_repeats);
                         ModeConfig::Mfsk(MfskParams { m, center, spacing, symbol_len_ms: sym, preamble_repeats: pre_r })
                     }
                     "dpsk" => {
+                        // DPSK simple handling (no presets yet)
                         let center = req.mfsk_center.unwrap_or(1500.0);
                         let sym = req.symbol_len_ms.unwrap_or(80);
                         let pre_r = req.preamble_repeats.unwrap_or(3);
                         ModeConfig::Dpsk(DpskParams { center, symbol_len_ms: sym, preamble_repeats: pre_r })
                     }
                     other => {
-                        // fallback to mfsk
-                        let m = req.mfsk_m.unwrap_or(4);
-                        let center = req.mfsk_center.unwrap_or(1500.0);
-                        let spacing = req.mfsk_spacing.unwrap_or(200.0);
-                        let sym = req.symbol_len_ms.unwrap_or(80);
-                        let pre_r = req.preamble_repeats.unwrap_or(3);
+                        // fallback to mfsk defaults if unknown
+                        let base = MfskParams { m: 4, center: 1500.0, spacing: 200.0, symbol_len_ms: 80, preamble_repeats: 3 };
+                        let m = req.mfsk_m.unwrap_or(base.m);
+                        let center = req.mfsk_center.unwrap_or(base.center);
+                        let spacing = req.mfsk_spacing.unwrap_or(base.spacing);
+                        let sym = req.symbol_len_ms.unwrap_or(base.symbol_len_ms);
+                        let pre_r = req.preamble_repeats.unwrap_or(base.preamble_repeats);
                         ModeConfig::Mfsk(MfskParams { m, center, spacing, symbol_len_ms: sym, preamble_repeats: pre_r })
                     }
                 };
@@ -742,6 +766,7 @@ fn handle_client(
                 let resp = json!({"ok": true, "pushed": pushed, "samples": frame.len()});
                 writeln!(writer, "{}", resp.to_string())?;
             }
+
             _ => {
                 writeln!(writer, "{}", json!({"ok": false, "error": "unknown command"}).to_string())?;
             }
