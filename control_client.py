@@ -1,43 +1,34 @@
-# control_client.py
-import socket, json, time, sys
-
-HOST = '127.0.0.1'
-PORT = 53421
+import socket, json, time
 
 def send(req):
-    s = socket.create_connection((HOST, PORT), timeout=2)
+    s = socket.create_connection(('127.0.0.1', 53421), timeout=2)
     s.sendall((json.dumps(req) + '\n').encode('utf-8'))
     resp = s.recv(8192).decode('utf-8')
     s.close()
+    print(resp)
     return resp
 
-if __name__ == '__main__':
-    print("Listing devices...")
-    print(send({"cmd":"list_devices"}))
+# list devices (copy ids)
+send({"cmd":"list_devices"})
 
-    # >>> pick ids from the list printed by your hush core above.
-    # Example: use device 1 as input and 2 as output — CHANGE these to match your system.
-    input_id = 5
-    output_id = 2
+# open both input & output so loopback works (use your device ids)
+send({"cmd":"open","input":6,"output":1,"sr":48000})
 
-    # Open streams
-    print("Opening streams (change input_id/output_id as needed)...")
-    print(send({"cmd":"open","input":input_id,"output":output_id,"sr":48000}))
+# send an MFSK frame
+send({
+ "cmd":"send_frame",
+ "mode":"mfsk",
+ "mfsk_m":4,
+ "mfsk_center":1500.0,
+ "mfsk_spacing":200.0,
+ "symbol_len_ms":80,
+ "preamble_repeats":3,
+ "payload_bits":"1011001110001010"
+})
 
-    # Start tone
-    print("Starting TX tone at 700 Hz for 4s...")
-    print(send({"cmd":"start_tx","tone_freq":700}))
-    time.sleep(4)
 
-    # Stop tone
-    print("Stopping TX...")
-    print(send({"cmd":"stop_tx"}))
-
-    # Query status
-    print("Status:")
-    print(send({"cmd":"status"}))
-
-    # Close streams
-    print("Closing streams...")
-    print(send({"cmd":"close"}))
-    print("Done.")
+# Optionally start tone fallback
+send({"cmd":"start_tx","tone_freq":700})
+time.sleep(1)
+send({"cmd":"stop_tx"})
+send({"cmd":"close"})
