@@ -115,12 +115,12 @@ struct Req {
 // TODO: work on adding more
 fn presets_map() -> HashMap<&'static str, MfskParams> {
     let mut m = HashMap::new();
-    m.insert("QRP_ULTRA", MfskParams { m: 4,  center: 1500.0, spacing: 50.0,  symbol_len_ms: 300, preamble_repeats: 8 });
-    m.insert("QRP",       MfskParams { m: 4,  center: 1500.0, spacing: 100.0, symbol_len_ms: 150, preamble_repeats: 6 });
-    m.insert("SLOW",      MfskParams { m: 8,  center: 1500.0, spacing: 100.0, symbol_len_ms: 100, preamble_repeats: 5 });
-    m.insert("MEDIUM",    MfskParams { m: 16, center: 1500.0, spacing: 150.0, symbol_len_ms: 60,  preamble_repeats: 4 });
-    m.insert("FAST",      MfskParams { m: 32, center: 1500.0, spacing: 200.0, symbol_len_ms: 30,  preamble_repeats: 3 });
-    m.insert("TURBO",     MfskParams { m: 64, center: 1500.0, spacing: 240.0, symbol_len_ms: 20,  preamble_repeats: 3 });
+    m.insert("QRP_ULTRA", MfskParams { m: 4,  center: 1000.0, spacing: 5.0,  symbol_len_ms: 300, preamble_repeats: 8 });
+    m.insert("QRP",       MfskParams { m: 4,  center: 1000.0, spacing: 10.0, symbol_len_ms: 150, preamble_repeats: 6 });
+    m.insert("SLOW",      MfskParams { m: 8,  center: 1000.0, spacing: 20.0, symbol_len_ms: 100, preamble_repeats: 5 });
+    m.insert("MEDIUM",    MfskParams { m: 16, center: 1000.0, spacing: 20.0, symbol_len_ms: 60,  preamble_repeats: 4 });
+    m.insert("FAST",      MfskParams { m: 32, center: 1000.0, spacing: 30.0, symbol_len_ms: 30,  preamble_repeats: 3 });
+    m.insert("TURBO",     MfskParams { m: 64, center: 1000.0, spacing: 200.0, symbol_len_ms: 20,  preamble_repeats: 3 });
     m
 }
 
@@ -143,7 +143,22 @@ mod modems {
         out
     }
 
+    pub fn generate_tone_with_phase(freq: f32, dur_s: f32, sr: u32, phi: &mut f32) -> Vec<f32> {
+        let n = (dur_s * sr as f32).round() as usize;
+        let mut out = Vec::with_capacity(n);
+        let dt = 1.0f32 / sr as f32;
+        let two_pi = PI * 2.0;
+        for _ in 0..n {
+            out.push(phi.sin());
+            *phi += two_pi * freq * dt;
+            if *phi > two_pi { *phi -= two_pi; }
+        }
+        out
+    }
+
+
     pub fn generate_mfsk_frame(sr: u32, params: &MfskParams, payload_bits: &str) -> Vec<f32> {
+        let mut phi = 0.0f32;
         let sym_s = params.symbol_len_ms as f32 / 1000.0;
         let mut frame: Vec<f32> = Vec::new();
         // tone0 is lowest tone
@@ -166,11 +181,18 @@ mod modems {
             i += bits_per_symbol;
             let tone_index = val % params.m;
             let tone_freq = tone0 + (tone_index as f32) * params.spacing;
-            let t = generate_tone(tone_freq, sym_s, sr);
+            let t = generate_tone_with_phase(tone_freq, sym_s, sr, &mut phi);
             frame.extend_from_slice(&t);
         }
         // postamble: one symbol silence
-        let post = vec![0.0f32; ((sym_s * sr as f32).round() as usize)];
+        let n = (sym_s * sr as f32).round() as usize;
+        let mut post: Vec<f32> = vec![0.0; n];
+        for i in 0..n {
+            let w = 0.5 * (1.0 - ((i as f32) / (n as f32) * PI).cos());
+            post[i] *= w;
+        }
+        
+
         frame.extend_from_slice(&post);
         frame
     }
